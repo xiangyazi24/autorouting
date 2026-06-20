@@ -53,33 +53,46 @@ export function getDistanceToOvercomeObstacle({
     SHOULD_DETECT_CONJOINED_OBSTACLES &&
     obstaclesInRow < MAX_CONJOINED_OBSTACLES
   ) {
-    // TODO: we need to detect all possible obstacles between the wallDistance
-    // and the node at the end of the distToOvercomeObstacle, there could be
-    // multiple obstacles that could interrupt the path of the node at it's
-    // next turn
-    // http://localhost:3080/problem/traces/18#t2_iter[14] is a great example
-    // of a path being too close because of a bad distToOvercomeObstacle b/c
-    // of missing detection of obstacles within the wallDistance
-    const obstacleAtEnd = obstacles.getObstacleAt(
-      node.x +
-        travelDir.dx * distToOvercomeObstacle +
-        wallDir.dx * (wallDir.wallDistance + 0.001),
-      node.y +
-        travelDir.dy * distToOvercomeObstacle +
-        wallDir.dy * (wallDir.wallDistance + 0.001),
-    )
-    // const obstaclesAtEnd = obstacles.getObstaclesOverlappingRegion({
-    //   minX: node.x + travelDir.dx * distToOvercomeObstacle,
-    //   minY: node.y + travelDir.dy * distToOvercomeObstacle,
-    //   maxX:
-    //     node.x +
-    //     travelDir.dx * distToOvercomeObstacle +
-    //     wallDir.dx * wallDir.wallDistance,
-    //   maxY:
-    //     node.y +
-    //     travelDir.dy * distToOvercomeObstacle +
-    //     wallDir.dy * wallDir.wallDistance,
-    // })
+    // Detect every obstacle in the swept region between the node at the end of
+    // distToOvercomeObstacle and the wall it would follow after turning. A
+    // single-point check (the previous getObstacleAt sample) only finds an
+    // obstacle that happens to sit exactly under the sampled point, so it
+    // under-estimates the overcome distance whenever a conjoined obstacle
+    // overlaps the region but not that one point. The under-estimate makes the
+    // autorouter believe it must switch direction, producing wild trace jumps.
+    // https://github.com/tscircuit/autorouting/issues/92
+    const endX = node.x + travelDir.dx * distToOvercomeObstacle
+    const endY = node.y + travelDir.dy * distToOvercomeObstacle
+    const wallX = endX + wallDir.dx * wallDir.wallDistance
+    const wallY = endY + wallDir.dy * wallDir.wallDistance
+    const obstaclesAtEnd = obstacles.getObstaclesOverlappingRegion({
+      minX: Math.min(endX, wallX),
+      minY: Math.min(endY, wallY),
+      maxX: Math.max(endX, wallX),
+      maxY: Math.max(endY, wallY),
+      // ObstacleList3d filters by layer; the base ObstacleList ignores `l`.
+      l: (node as { l?: number }).l,
+    } as any)
+
+    // Of every obstacle overlapping the region, the binding one is whichever
+    // protrudes furthest along the travel direction, because that is the
+    // obstacle we still have to clear before we can safely turn.
+    let obstacleAtEnd: Obstacle | null = null
+    let furthestEdge = -Infinity
+    for (const candidate of obstaclesAtEnd) {
+      const edge =
+        travelDir.dx !== 0
+          ? travelDir.dx > 0
+            ? candidate.center.x + candidate.width / 2
+            : -(candidate.center.x - candidate.width / 2)
+          : travelDir.dy > 0
+            ? candidate.center.y + candidate.height / 2
+            : -(candidate.center.y - candidate.height / 2)
+      if (edge > furthestEdge) {
+        furthestEdge = edge
+        obstacleAtEnd = candidate
+      }
+    }
 
     if (obstacleAtEnd === obstacle) {
       return distToOvercomeObstacle

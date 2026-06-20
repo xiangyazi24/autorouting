@@ -153,11 +153,15 @@ export class ObstacleList {
     for (const obstacle of this.obstacles) {
       const { left, right, top, bottom } = obstacle
 
+      // Standard AABB overlap test. top is the obstacle's max-y edge and bottom
+      // its min-y edge, so an overlap requires bottom <= region.maxY and
+      // top >= region.minY (the y inequalities were previously inverted, which
+      // turned this into a containment test that missed tall obstacles).
       if (
         left <= region.maxX &&
         right >= region.minX &&
-        top <= region.maxY &&
-        bottom >= region.minY
+        bottom <= region.maxY &&
+        top >= region.minY
       ) {
         obstacles.push(obstacle)
       }
