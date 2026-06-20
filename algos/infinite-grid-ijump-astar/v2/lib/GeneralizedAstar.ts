@@ -17,6 +17,13 @@ import { addViasWhenLayerChanges } from "solver-postprocessing/add-vias-when-lay
 import type { AnyCircuitElement } from "circuit-json"
 import { shortenPathWithShortcuts } from "./shortenPathWithShortcuts"
 import type { ObstacleList3d } from "algos/multi-layer-ijump/ObstacleList3d"
+import {
+  getBoardMetrics,
+  compareBoardMetrics,
+  countCrossNetObstacleOverlaps,
+  sortConnectionsShortestFirst,
+  seededShuffleConnections,
+} from "./boardReroute"
 
 const debug = Debug("autorouting-dataset:astar")
 
@@ -27,6 +34,30 @@ export interface PointWithLayer extends Point {
 export type ConnectionSolveResult =
   | { solved: false; connectionName: string }
   | { solved: true; connectionName: string; route: PointWithLayer[] }
+
+/**
+ * How far a route's polyline extends outside the bounding box of its two
+ * endpoints. A normal route stays close to that box; a "wild jump" (the route
+ * shoots far away from both endpoints and comes back before reaching the goal)
+ * produces a large value. See https://github.com/tscircuit/autorouting/issues/92
+ */
+export function getEndpointBBoxExcursion(route: PointWithLayer[]): number {
+  if (route.length < 2) return 0
+  const start = route[0]
+  const end = route[route.length - 1]
+  const minX = Math.min(start.x, end.x)
+  const maxX = Math.max(start.x, end.x)
+  const minY = Math.min(start.y, end.y)
+  const maxY = Math.max(start.y, end.y)
+  let excursion = 0
+  for (const p of route) {
+    if (p.x < minX) excursion = Math.max(excursion, minX - p.x)
+    if (p.x > maxX) excursion = Math.max(excursion, p.x - maxX)
+    if (p.y < minY) excursion = Math.max(excursion, minY - p.y)
+    if (p.y > maxY) excursion = Math.max(excursion, p.y - maxY)
+  }
+  return excursion
+}
 
 export class GeneralizedAstarAutorouter {
   openSet: Node[] = []
@@ -55,6 +86,25 @@ export class GeneralizedAstarAutorouter {
    */
   GREEDY_MULTIPLIER = 1.1
 
+  /**
+   * The greedy heuristic is fast but can commit a net to a wild out-and-back
+   * detour. Any solved route that leaves its endpoints' bounding box by more
+   * than this many mm is treated as a "wild jump" — repaired by the shortcut
+   * pass, and used to trigger the board reroute under alternative net orders.
+   * See https://github.com/tscircuit/autorouting/issues/92
+   */
+  WILD_JUMP_EXCURSION_THRESHOLD: number
+
+  /**
+   * When the input-order board contains wild routes, re-route the whole board
+   * under alternative net orderings (shortest-first, then deterministic
+   * shuffles) and keep whichever board is least wild without losing routed nets
+   * (issue #92). Disable to get pure input-order greedy output.
+   */
+  isWildJumpRerouteEnabled: boolean
+  /** Number of deterministic shuffle orderings tried after shortest-first. */
+  WILD_JUMP_REROUTE_RESTARTS: number
+
   iterations: number = -1
 
   constructor(opts: {
@@ -66,6 +116,9 @@ export class GeneralizedAstarAutorouter {
     MAX_ITERATIONS?: number
     isRemovePathLoopsEnabled?: boolean
     isShortenPathWithShortcutsEnabled?: boolean
+    WILD_JUMP_EXCURSION_THRESHOLD?: number
+    isWildJumpRerouteEnabled?: boolean
+    WILD_JUMP_REROUTE_RESTARTS?: number
     debug?: boolean
   }) {
     this.input = opts.input
@@ -81,6 +134,10 @@ export class GeneralizedAstarAutorouter {
     this.isRemovePathLoopsEnabled = opts.isRemovePathLoopsEnabled ?? false
     this.isShortenPathWithShortcutsEnabled =
       opts.isShortenPathWithShortcutsEnabled ?? false
+    this.WILD_JUMP_EXCURSION_THRESHOLD =
+      opts.WILD_JUMP_EXCURSION_THRESHOLD ?? 10
+    this.isWildJumpRerouteEnabled = opts.isWildJumpRerouteEnabled ?? true
+    this.WILD_JUMP_REROUTE_RESTARTS = opts.WILD_JUMP_REROUTE_RESTARTS ?? 6
     if (this.debug) {
       debug.enabled = true
     }
@@ -271,7 +328,14 @@ export class GeneralizedAstarAutorouter {
           route = removePathLoops(route)
         }
 
-        if (this.isShortenPathWithShortcutsEnabled) {
+        // Repair wild out-and-back detours (issue #92) by collapsing them with
+        // the shortcut pass. This runs whenever shortcut-repair is explicitly
+        // enabled, OR whenever the greedy route left its endpoints' bounding
+        // box by more than the wild-jump threshold — so clean routes are left
+        // untouched and only pathological ones are repaired.
+        const isWildRoute =
+          getEndpointBBoxExcursion(route) > this.WILD_JUMP_EXCURSION_THRESHOLD
+        if (this.isShortenPathWithShortcutsEnabled || isWildRoute) {
           route = shortenPathWithShortcuts(route, (A, B) => {
             if (A.x === B.x && A.y === B.y) return false
             const collision = (
@@ -288,7 +352,9 @@ export class GeneralizedAstarAutorouter {
                 dl: 0,
               },
               {
-                margin: 0.05,
+                // Use the obstacle clearance margin, not a token 0.05, so the
+                // shortcut cannot be accepted within clearance of another trace.
+                margin: this.OBSTACLE_MARGIN,
               },
             )
             const dist = Math.sqrt((A.x - B.x) ** 2 + (A.y - B.y) ** 2)
@@ -347,11 +413,32 @@ export class GeneralizedAstarAutorouter {
    * and add obstacles for each successfully solved connection. Override this
    * to implement "rip and replace" rerouting strategies.
    */
-  solve(): ConnectionSolveResult[] {
+  /**
+   * Map a connection name to its connectivity-net id (so a route may legally
+   * pass over its own net's pads). Overridden by subclasses with a connMap.
+   */
+  getConnectionNetId(connectionName: string): string {
+    return connectionName
+  }
+
+  /**
+   * Override to reset any mutable per-board state (e.g. a connectivity map that
+   * accumulates solved traces) so the board can be routed again from scratch in
+   * a different search mode. Called before each board pass except the first.
+   */
+  resetBoardPassState(): void {}
+
+  /**
+   * Route every connection once, in the given order (default: input order),
+   * committing each solved trace as an obstacle for subsequent connections.
+   */
+  solveBoardOnce(
+    connections: SimpleRouteConnection[] = this.input.connections,
+  ): ConnectionSolveResult[] {
     const solutions: ConnectionSolveResult[] = []
     const obstaclesFromTraces: Obstacle[] = []
     this.debugTraceCount = 0
-    for (const connection of this.input.connections) {
+    for (const connection of connections) {
       const dominantLayer = connection.pointsToConnect[0].layer ?? "top"
       this.debugTraceCount += 1
       this.obstacles = this.createObstacleList({
@@ -382,6 +469,59 @@ export class GeneralizedAstarAutorouter {
     }
 
     return solutions
+  }
+
+  /**
+   * Alternative net orderings tried (in order) when the input-order board has a
+   * wild route. Shortest-first comes first because long early nets are what box
+   * later nets into detours; a few deterministic shuffles follow as a fallback.
+   */
+  getRerouteConnectionOrderings(): SimpleRouteConnection[][] {
+    const orderings = [sortConnectionsShortestFirst(this.input.connections)]
+    for (let i = 0; i < this.WILD_JUMP_REROUTE_RESTARTS; i++) {
+      orderings.push(
+        seededShuffleConnections(this.input.connections, 0x9e3779b1 + i),
+      )
+    }
+    return orderings
+  }
+
+  solve(): ConnectionSolveResult[] {
+    const greedy = this.solveBoardOnce()
+    if (!this.isWildJumpRerouteEnabled) return greedy
+
+    const threshold = this.WILD_JUMP_EXCURSION_THRESHOLD
+    const baseMetrics = getBoardMetrics(greedy, threshold)
+    // Clean board: keep the input-order result untouched (no snapshot churn).
+    if (baseMetrics.wildNetCount === 0) return greedy
+
+    // The input net order boxed a later net into a wild detour. Re-route the
+    // whole board under alternative net orderings and keep the least-wild board
+    // that (a) routes at least as many nets as the input order and (b) is
+    // DRC-clean by construction — no route passes copper over another net's pad.
+    const traceWidth = this.input.minTraceWidth ?? 0.1
+    let best = greedy
+    let bestMetrics = baseMetrics
+    for (const ordering of this.getRerouteConnectionOrderings()) {
+      this.resetBoardPassState()
+      const candidate = this.solveBoardOnce(ordering)
+      const m = getBoardMetrics(candidate, threshold)
+      if (
+        m.routedCount >= baseMetrics.routedCount &&
+        compareBoardMetrics(m, bestMetrics, this.GRID_STEP) < 0 &&
+        countCrossNetObstacleOverlaps(
+          candidate,
+          this.allObstacles as any,
+          (name) => this.getConnectionNetId(name),
+          traceWidth,
+        ) === 0
+      ) {
+        best = candidate
+        bestMetrics = m
+      }
+      if (bestMetrics.wildNetCount === 0) break
+    }
+    return best
   }
 
   solveAndMapToTraces(): SimplifiedPcbTrace[] {

@@ -97,6 +97,9 @@ export class MultilayerIjump extends GeneralizedAstarAutorouter {
     VIA_COST?: number
     isRemovePathLoopsEnabled?: boolean
     isShortenPathWithShortcutsEnabled?: boolean
+    WILD_JUMP_EXCURSION_THRESHOLD?: number
+    isWildJumpRerouteEnabled?: boolean
+    WILD_JUMP_REROUTE_RESTARTS?: number
     connMap?: ConnectivityMap
     pcbConnMap?: PcbConnectivityMap
     optimizeWithGoalBoxes?: boolean
@@ -139,6 +142,18 @@ export class MultilayerIjump extends GeneralizedAstarAutorouter {
       connection,
       pcbConnMap: this.pcbConnMap!,
     })
+  }
+
+  getConnectionNetId(connectionName: string): string {
+    return this.connMap?.getNetConnectedToId(connectionName) ?? connectionName
+  }
+
+  /**
+   * Reset the per-board connectivity map so a fresh board pass (e.g. the
+   * quality-aware wild-jump reroute) does not see the previous pass's traces.
+   */
+  resetBoardPassState(): void {
+    this.pcbConnMap = new PcbConnectivityMap()
   }
 
   /**
