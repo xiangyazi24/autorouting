@@ -6,6 +6,11 @@ on:
     paths:
       - '.github/workflows/q5384-temp.yml'
       - 'q5384-trigger.txt'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/q5384-temp.yml'
+      - 'q5384-trigger.txt'
 
 permissions:
   contents: write
@@ -44,6 +49,7 @@ jobs:
           const ps=[101,1009,10007],H=50,out={},csv=['p,h,r,cumulative'];
           for(const p of ps){const {c,R}=counts(p,H),hs=Array.from({length:H},(_,i)=>i+1);out[p]={counts:c.slice(1),cumulative:R.slice(1),stats:{total:R[H],mean:R[H]/H,checkpoints:Object.fromEntries([10,20,30,40,50].map(h=>[h,R[h]])),linear:fit(hs,hs.map(h=>R[h])),quadratic:fit(hs.map(h=>h*h),hs.map(h=>R[h])),evenMean:hs.filter(h=>h%2===0).reduce((s,h)=>s+c[h],0)/25,oddMean:hs.filter(h=>h%2===1).reduce((s,h)=>s+c[h],0)/25}};for(let h=1;h<=H;h++)csv.push(`${p},${h},${c[h]},${R[h]}`)}
           fs.writeFileSync('q5384-output.json',JSON.stringify(out,null,2)+'\n');fs.writeFileSync('q5384-output.csv',csv.join('\n')+'\n');
+          console.log(JSON.stringify(out));
           NODE
       - name: Commit outputs
         run: |
