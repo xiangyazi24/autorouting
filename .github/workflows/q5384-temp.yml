@@ -1,0 +1,54 @@
+name: Temporary Q5384 computation
+
+on:
+  push:
+    branches: [q5384-mathjs-temp]
+    paths:
+      - '.github/workflows/q5384-temp.yml'
+      - 'q5384-trigger.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: q5384-mathjs-temp
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Compute canonical Apéry gap root counts
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          function mod(a,p){a%=p;return a<0?a+p:a}
+          function mul(a,b,p){return (a*b)%p}
+          function pow(a,e,p){a=mod(a,p);let r=1;while(e){if(e&1)r=mul(r,a,p);a=mul(a,a,p);e>>=1}return r}
+          function P(t,p){t=mod(t,p);const t2=mul(t,t,p),t3=mul(t2,t,p);return mod(34*t3+51*t2+27*t+5,p)}
+          function counts(p,H){
+            const c=Array(H+1).fill(0),R=Array(H+1).fill(0);c[1]=0;
+            for(let x=0;x<p;x++){
+              let a=1,b=P(x+1,p);if(H>=2&&b===0)c[2]++;
+              for(let h=2;h<H;h++){
+                const t=x+h,nxt=mod(mul(P(t,p),b,p)-mul(pow(t,6,p),a,p),p);
+                if(nxt===0)c[h+1]++;a=b;b=nxt;
+              }
+            }
+            for(let h=1;h<=H;h++)R[h]=R[h-1]+c[h];return {c,R};
+          }
+          function fit(xs,ys){const n=xs.length,mx=xs.reduce((a,b)=>a+b,0)/n,my=ys.reduce((a,b)=>a+b,0)/n;let xx=0,xy=0,yy=0;for(let i=0;i<n;i++){const dx=xs[i]-mx,dy=ys[i]-my;xx+=dx*dx;xy+=dx*dy;yy+=dy*dy}return{slope:xy/xx,intercept:my-(xy/xx)*mx,r2:xy*xy/(xx*yy)}}
+          const ps=[101,1009,10007],H=50,out={},csv=['p,h,r,cumulative'];
+          for(const p of ps){const {c,R}=counts(p,H),hs=Array.from({length:H},(_,i)=>i+1);out[p]={counts:c.slice(1),cumulative:R.slice(1),stats:{total:R[H],mean:R[H]/H,checkpoints:Object.fromEntries([10,20,30,40,50].map(h=>[h,R[h]])),linear:fit(hs,hs.map(h=>R[h])),quadratic:fit(hs.map(h=>h*h),hs.map(h=>R[h])),evenMean:hs.filter(h=>h%2===0).reduce((s,h)=>s+c[h],0)/25,oddMean:hs.filter(h=>h%2===1).reduce((s,h)=>s+c[h],0)/25}};for(let h=1;h<=H;h++)csv.push(`${p},${h},${c[h]},${R[h]}`)}
+          fs.writeFileSync('q5384-output.json',JSON.stringify(out,null,2)+'\n');fs.writeFileSync('q5384-output.csv',csv.join('\n')+'\n');
+          NODE
+      - name: Commit outputs
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add q5384-output.json q5384-output.csv
+          git commit -m 'Compute Q5384 gap root counts' || exit 0
+          git push origin HEAD:q5384-mathjs-temp
